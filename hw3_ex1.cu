@@ -143,16 +143,20 @@ double get_elapsed(tval t0, tval t1)
  * Stores the result image and prints a message.
  */
 void store_result(int index, double elapsed_cpu, double elapsed_gpu,
-                  int width, int height, float *image_cpu, float *image_gpu, int gpu_enabled)
+                  int width, int height, float *image_cpu, float *image_gpu, 
+                  int gpu_enabled, const char *gpu_suffix)
 {
     char path_cpu[255];
     char path_gpu[255];
     
-    sprintf(path_cpu, "images/hw3_result_cpu_%d.bmp", index);
-    writeBMPGrayscale(width, height, image_cpu, path_cpu);
-    
-    printf("Step #%d Completed:\n", index);
-    printf("  CPU result stored in \"%s\" (Elapsed CPU: %fms)\n", path_cpu, elapsed_cpu);
+    if (elapsed_cpu > 0)
+    {
+        sprintf(path_cpu, "images/hw3_result_cpu_%d.bmp", index);
+        writeBMPGrayscale(width, height, image_cpu, path_cpu);
+        
+        printf("Step #%d Completed:\n", index);
+        printf("  CPU result stored in \"%s\" (Elapsed CPU: %fms)\n", path_cpu, elapsed_cpu);
+    }
     
     if (!gpu_enabled)
     {
@@ -160,7 +164,7 @@ void store_result(int index, double elapsed_cpu, double elapsed_gpu,
     }
     else
     {
-        sprintf(path_gpu, "images/hw3_result_gpu_%d.bmp", index);
+        sprintf(path_gpu, "images/hw3_result_gpu%s_%d.bmp", gpu_suffix, index);
         writeBMPGrayscale(width, height, image_gpu, path_gpu);
         printf("  GPU result stored in \"%s\" (Elapsed GPU: %fms)\n", path_gpu, elapsed_gpu);
     }
@@ -293,6 +297,66 @@ __global__ void gpu_gaussian(int width, int height, float *image, float *image_o
 }
 
 /**
+ * Applies a Gaussian 3x3 filter to a given image using the GPU (Shared Memory).
+ */
+__global__ void gpu_gaussian_shared(int width, int height, float *image, float *image_out)
+{
+    float gaussian[9] = { 1.0f / 16.0f, 2.0f / 16.0f, 1.0f / 16.0f,
+                          2.0f / 16.0f, 4.0f / 16.0f, 2.0f / 16.0f,
+                          1.0f / 16.0f, 2.0f / 16.0f, 1.0f / 16.0f };
+    
+    __shared__ float tile[BLOCK_SIZE + 2][BLOCK_SIZE + 2];
+    
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    
+    int bx = blockIdx.x * BLOCK_SIZE;
+    int by = blockIdx.y * BLOCK_SIZE;
+    
+    int gx = bx + tx;
+    int gy = by + ty;
+    
+    tile[ty][tx] = (gx < width && gy < height) ? image[gy * width + gx] : 0.0f;
+    
+    if (tx < 2)
+    {
+        int gx2 = bx + tx + BLOCK_SIZE;
+        tile[ty][tx + BLOCK_SIZE] = (gx2 < width && gy < height) ? image[gy * width + gx2] : 0.0f;
+    }
+    
+    if (ty < 2)
+    {
+        int gy2 = by + ty + BLOCK_SIZE;
+        tile[ty + BLOCK_SIZE][tx] = (gx < width && gy2 < height) ? image[gy2 * width + gx] : 0.0f;
+    }
+    
+    if (tx < 2 && ty < 2)
+    {
+        int gx2 = bx + tx + BLOCK_SIZE;
+        int gy2 = by + ty + BLOCK_SIZE;
+        tile[ty + BLOCK_SIZE][tx + BLOCK_SIZE] = (gx2 < width && gy2 < height) ? image[gy2 * width + gx2] : 0.0f;
+    }
+    
+    __syncthreads();
+    
+    if (gx < (width - 2) && gy < (height - 2))
+    {
+        float pixel = tile[ty + 0][tx + 0] * gaussian[0] +
+                      tile[ty + 0][tx + 1] * gaussian[1] +
+                      tile[ty + 0][tx + 2] * gaussian[2] +
+                      tile[ty + 1][tx + 0] * gaussian[3] +
+                      tile[ty + 1][tx + 1] * gaussian[4] +
+                      tile[ty + 1][tx + 2] * gaussian[5] +
+                      tile[ty + 2][tx + 0] * gaussian[6] +
+                      tile[ty + 2][tx + 1] * gaussian[7] +
+                      tile[ty + 2][tx + 2] * gaussian[8];
+        int offset = (gy + 1) * width + (gx + 1);
+        image_out[offset] = pixel;
+    }
+}
+
+
+/**
  * Calculates the gradient of an image using a Sobel filter on the CPU.
  */
 void cpu_sobel(int width, int height, float *image, float *image_out)
@@ -338,6 +402,7 @@ int main(int argc, char **argv)
     float    *d_bitmap       = { 0 };
     float    *image_out_cpu[2] = { 0 };
     float    *image_out_gpu[2] = { 0 };
+    float    *image_out_gpu_shared[2] = { 0 };
     float    *d_image_out[2]   = { 0 };
     int      image_size      = 0;
     tval     t[2]            = { 0 };
@@ -365,6 +430,7 @@ int main(int argc, char **argv)
     {
         image_out_cpu[i] = (float *)calloc(image_size, sizeof(float));
         image_out_gpu[i] = (float *)calloc(image_size, sizeof(float));
+        image_out_gpu_shared[i] = (float *)calloc(image_size, sizeof(float));
         
         gpuErrchk( cudaMalloc(&d_image_out[i], image_size * sizeof(float)) );
         gpuErrchk( cudaMemset(d_image_out[i], 0, image_size * sizeof(float)) );
@@ -397,7 +463,7 @@ int main(int argc, char **argv)
         
         // Store the result image in grayscale
         store_result(1, elapsed[0], elapsed[1], bitmap.width, bitmap.height,
-                     image_out_cpu[0], image_out_gpu[0], 1);
+                     image_out_cpu[0], image_out_gpu[0], 1, "");
     }
     
     // Step 2: Apply a 3x3 Gaussian filter
@@ -423,7 +489,26 @@ int main(int argc, char **argv)
         
         // Store the result image with the Gaussian filter applied
         store_result(2, elapsed[0], elapsed[1], bitmap.width, bitmap.height,
-                     image_out_cpu[1], image_out_gpu[1], 1);
+                     image_out_cpu[1], image_out_gpu[1], 1, "");
+
+        // Launch the GPU version (Shared Memory)
+        gpuErrchk( cudaMemset(d_image_out[1], 0, image_size * sizeof(float)) );
+        
+        double elapsed_shared = 0.0;
+        gettimeofday(&t[0], NULL);
+        gpu_gaussian_shared<<<grid, block>>>(bitmap.width, bitmap.height,
+                                             d_image_out[0], d_image_out[1]);
+        gpuErrchk( cudaGetLastError() );
+        
+        gpuErrchk( cudaMemcpy(image_out_gpu_shared[1], d_image_out[1],
+                              image_size * sizeof(float), cudaMemcpyDeviceToHost) );
+        gettimeofday(&t[1], NULL);
+        
+        elapsed_shared = get_elapsed(t[0], t[1]);
+        
+        // Store the result image for the shared memory version (omits CPU time logging)
+        store_result(2, 0, elapsed_shared, bitmap.width, bitmap.height,
+                     image_out_cpu[1], image_out_gpu_shared[1], 1, "_shared");
     }
     
     // Step 3: Apply a Sobel filter
@@ -448,7 +533,7 @@ int main(int argc, char **argv)
         
         // Store the final result image with the Sobel filter applied
         store_result(3, elapsed[0], 0, bitmap.width, bitmap.height,
-                     image_out_cpu[0], image_out_gpu[0], 0);
+                     image_out_cpu[0], image_out_gpu[0], 0, "");
     }
     
     // Release the allocated memory
@@ -456,6 +541,7 @@ int main(int argc, char **argv)
     {
         free(image_out_cpu[i]);
         free(image_out_gpu[i]);
+        free(image_out_gpu_shared[i]);
         gpuErrchk( cudaFree(d_image_out[i]) );
     }
     
