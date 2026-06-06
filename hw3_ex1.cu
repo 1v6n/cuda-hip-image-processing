@@ -4,6 +4,21 @@
 #include <string.h>
 #include <sys/time.h>
 
+#ifdef __HIPCC__
+#include <hip/hip_runtime.h>
+#define cudaMalloc hipMalloc
+#define cudaMemset hipMemset
+#define cudaMemcpy hipMemcpy
+#define cudaFree hipFree
+#define cudaGetLastError hipGetLastError
+#define cudaGetErrorString hipGetErrorString
+#define cudaSuccess hipSuccess
+#define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaError_t hipError_t
+#endif
+
 #define BLOCK_SIZE  16
 #define HEADER_SIZE 138
 
@@ -105,17 +120,16 @@ void freeBMP(BMPImage bitmap)
  * Checks if there has been any CUDA error. The method will automatically print
  * some information and exit the program when an error is found.
  */
-void checkCUDAError()
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
-    cudaError_t cudaError = cudaGetLastError();
-    
-    if(cudaError != cudaSuccess)
-    {
-        printf("CUDA Error: Returned %d: %s\n", cudaError,
-                                                cudaGetErrorString(cudaError));
-        exit(-1);
-    }
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
 }
+#define checkCUDAError() gpuErrchk(cudaGetLastError())
 
 /**
  * Calculates the elapsed time between two time intervals (in milliseconds).
@@ -129,23 +143,26 @@ double get_elapsed(tval t0, tval t1)
  * Stores the result image and prints a message.
  */
 void store_result(int index, double elapsed_cpu, double elapsed_gpu,
-                     int width, int height, float *image)
+                  int width, int height, float *image_cpu, float *image_gpu, int gpu_enabled)
 {
-    char path[255];
+    char path_cpu[255];
+    char path_gpu[255];
     
-    sprintf(path, "images/hw3_result_%d.bmp", index);
-    writeBMPGrayscale(width, height, image, path);
+    sprintf(path_cpu, "images/hw3_result_cpu_%d.bmp", index);
+    writeBMPGrayscale(width, height, image_cpu, path_cpu);
     
-    printf("Step #%d Completed - Result stored in \"%s\".\n", index, path);
-    printf("Elapsed CPU: %fms / ", elapsed_cpu);
+    printf("Step #%d Completed:\n", index);
+    printf("  CPU result stored in \"%s\" (Elapsed CPU: %fms)\n", path_cpu, elapsed_cpu);
     
-    if (elapsed_gpu == 0)
+    if (!gpu_enabled)
     {
-        printf("[GPU version not available]\n");
+        printf("  [GPU version not available]\n");
     }
     else
     {
-        printf("Elapsed GPU: %fms\n", elapsed_gpu);
+        sprintf(path_gpu, "images/hw3_result_gpu_%d.bmp", index);
+        writeBMPGrayscale(width, height, image_gpu, path_gpu);
+        printf("  GPU result stored in \"%s\" (Elapsed GPU: %fms)\n", path_gpu, elapsed_gpu);
     }
 }
 
@@ -176,10 +193,18 @@ void cpu_grayscale(int width, int height, float *image, float *image_out)
  */
 __global__ void gpu_grayscale(int width, int height, float *image, float *image_out)
 {
-    ////////////////
-    // TO-DO #4.2 /////////////////////////////////////////////
-    // Implement the GPU version of the grayscale conversion //
-    ///////////////////////////////////////////////////////////
+    int index_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int index_y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (index_x < width && index_y < height)
+    {
+        int offset_out = index_y * width + index_x;
+        int offset_in  = offset_out * 3;
+        
+        image_out[offset_out] = image[offset_in + 0] * 0.0722f + // B
+                                image[offset_in + 1] * 0.7152f + // G
+                                image[offset_in + 2] * 0.2126f;  // R
+    }
 }
 
 /**
@@ -306,8 +331,9 @@ int main(int argc, char **argv)
 {
     BMPImage bitmap          = { 0 };
     float    *d_bitmap       = { 0 };
-    float    *image_out[2]   = { 0 };
-    float    *d_image_out[2] = { 0 };
+    float    *image_out_cpu[2] = { 0 };
+    float    *image_out_gpu[2] = { 0 };
+    float    *d_image_out[2]   = { 0 };
     int      image_size      = 0;
     tval     t[2]            = { 0 };
     double   elapsed[2]      = { 0 };
@@ -332,45 +358,48 @@ int main(int argc, char **argv)
     // Allocate the intermediate image buffers for each step
     for (int i = 0; i < 2; i++)
     {
-        image_out[i] = (float *)calloc(image_size, sizeof(float));
+        image_out_cpu[i] = (float *)calloc(image_size, sizeof(float));
+        image_out_gpu[i] = (float *)calloc(image_size, sizeof(float));
         
-        cudaMalloc(&d_image_out[i], image_size * sizeof(float));
-        cudaMemset(d_image_out[i], 0, image_size * sizeof(float));
+        gpuErrchk( cudaMalloc(&d_image_out[i], image_size * sizeof(float)) );
+        gpuErrchk( cudaMemset(d_image_out[i], 0, image_size * sizeof(float)) );
     }
 
-    cudaMalloc(&d_bitmap, image_size * sizeof(float) * 3);
-    cudaMemcpy(d_bitmap, bitmap.data,
-               image_size * sizeof(float) * 3, cudaMemcpyHostToDevice);
+    gpuErrchk( cudaMalloc(&d_bitmap, image_size * sizeof(float) * 3) );
+    gpuErrchk( cudaMemcpy(d_bitmap, bitmap.data,
+                          image_size * sizeof(float) * 3, cudaMemcpyHostToDevice) );
     
     // Step 1: Convert to grayscale
     {
         // Launch the CPU version
         gettimeofday(&t[0], NULL);
-        cpu_grayscale(bitmap.width, bitmap.height, bitmap.data, image_out[0]);
+        cpu_grayscale(bitmap.width, bitmap.height, bitmap.data, image_out_cpu[0]);
         gettimeofday(&t[1], NULL);
         
         elapsed[0] = get_elapsed(t[0], t[1]);
         
         // Launch the GPU version
         gettimeofday(&t[0], NULL);
-        // gpu_grayscale<<<grid, block>>>(bitmap.width, bitmap.height,
-        //                                d_bitmap, d_image_out[0]);
+        gpu_grayscale<<<grid, block>>>(bitmap.width, bitmap.height,
+                                       d_bitmap, d_image_out[0]);
+        gpuErrchk( cudaGetLastError() );
         
-        // cudaMemcpy(image_out[0], d_image_out[0],
-        //            image_size * sizeof(float), cudaMemcpyDeviceToHost);
+        gpuErrchk( cudaMemcpy(image_out_gpu[0], d_image_out[0],
+                              image_size * sizeof(float), cudaMemcpyDeviceToHost) );
         gettimeofday(&t[1], NULL);
         
         elapsed[1] = get_elapsed(t[0], t[1]);
         
         // Store the result image in grayscale
-        store_result(1, elapsed[0], elapsed[1], bitmap.width, bitmap.height, image_out[0]);
+        store_result(1, elapsed[0], elapsed[1], bitmap.width, bitmap.height,
+                     image_out_cpu[0], image_out_gpu[0], 1);
     }
     
     // Step 2: Apply a 3x3 Gaussian filter
     {
         // Launch the CPU version
         gettimeofday(&t[0], NULL);
-        cpu_gaussian(bitmap.width, bitmap.height, image_out[0], image_out[1]);
+        cpu_gaussian(bitmap.width, bitmap.height, image_out_cpu[0], image_out_cpu[1]);
         gettimeofday(&t[1], NULL);
         
         elapsed[0] = get_elapsed(t[0], t[1]);
@@ -380,21 +409,22 @@ int main(int argc, char **argv)
         // gpu_gaussian<<<grid, block>>>(bitmap.width, bitmap.height,
         //                               d_image_out[0], d_image_out[1]);
         
-        // cudaMemcpy(image_out[1], d_image_out[1],
+        // cudaMemcpy(image_out_gpu[1], d_image_out[1],
         //            image_size * sizeof(float), cudaMemcpyDeviceToHost);
         gettimeofday(&t[1], NULL);
         
         elapsed[1] = get_elapsed(t[0], t[1]);
         
         // Store the result image with the Gaussian filter applied
-        store_result(2, elapsed[0], elapsed[1], bitmap.width, bitmap.height, image_out[1]);
+        store_result(2, elapsed[0], 0, bitmap.width, bitmap.height,
+                     image_out_cpu[1], image_out_gpu[1], 0);
     }
     
     // Step 3: Apply a Sobel filter
     {
         // Launch the CPU version
         gettimeofday(&t[0], NULL);
-        cpu_sobel(bitmap.width, bitmap.height, image_out[1], image_out[0]);
+        cpu_sobel(bitmap.width, bitmap.height, image_out_cpu[1], image_out_cpu[0]);
         gettimeofday(&t[1], NULL);
         
         elapsed[0] = get_elapsed(t[0], t[1]);
@@ -404,25 +434,27 @@ int main(int argc, char **argv)
         // gpu_sobel<<<grid, block>>>(bitmap.width, bitmap.height,
         //                            d_image_out[1], d_image_out[0]);
         
-        // cudaMemcpy(image_out[0], d_image_out[0],
+        // cudaMemcpy(image_out_gpu[0], d_image_out[0],
         //            image_size * sizeof(float), cudaMemcpyDeviceToHost);
         gettimeofday(&t[1], NULL);
         
         elapsed[1] = get_elapsed(t[0], t[1]);
         
         // Store the final result image with the Sobel filter applied
-        store_result(3, elapsed[0], elapsed[1], bitmap.width, bitmap.height, image_out[0]);
+        store_result(3, elapsed[0], 0, bitmap.width, bitmap.height,
+                     image_out_cpu[0], image_out_gpu[0], 0);
     }
     
     // Release the allocated memory
     for (int i = 0; i < 2; i++)
     {
-        free(image_out[i]);
-        cudaFree(d_image_out[i]);
+        free(image_out_cpu[i]);
+        free(image_out_gpu[i]);
+        gpuErrchk( cudaFree(d_image_out[i]) );
     }
     
     freeBMP(bitmap);
-    cudaFree(d_bitmap);
+    gpuErrchk( cudaFree(d_bitmap) );
     
     return 0;
 }
