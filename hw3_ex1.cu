@@ -233,14 +233,19 @@ float cpu_applyFilter(float *image, int stride, float *matrix, int filter_dim)
  */
 __device__ float gpu_applyFilter(float *image, int stride, float *matrix, int filter_dim)
 {
+    float pixel = 0.0f;                                                                                            
+    for (int h = 0; h < filter_dim; h++) {                                                                         
+        for (int w = 0; w < filter_dim; w++) {                                                                     
+            pixel += image[h * stride + w] * matrix[h * filter_dim + w];                                           
+        }
+    }
+    return pixel;
     ////////////////
     // TO-DO #5.2 ////////////////////////////////////////////////
     // Implement the GPU version of cpu_applyFilter()           //
     //                                                          //
     // Does it make sense to have a separate gpu_applyFilter()? //
     //////////////////////////////////////////////////////////////
-    
-    return 0.0f;
 }
 
 /**
@@ -406,18 +411,19 @@ int main(int argc, char **argv)
         
         // Launch the GPU version
         gettimeofday(&t[0], NULL);
-        // gpu_gaussian<<<grid, block>>>(bitmap.width, bitmap.height,
-        //                               d_image_out[0], d_image_out[1]);
+        gpu_gaussian<<<grid, block>>>(bitmap.width, bitmap.height,
+                                      d_image_out[0], d_image_out[1]);
+        gpuErrchk( cudaGetLastError() );
         
-        // cudaMemcpy(image_out_gpu[1], d_image_out[1],
-        //            image_size * sizeof(float), cudaMemcpyDeviceToHost);
+        gpuErrchk( cudaMemcpy(image_out_gpu[1], d_image_out[1],
+                              image_size * sizeof(float), cudaMemcpyDeviceToHost) );
         gettimeofday(&t[1], NULL);
         
         elapsed[1] = get_elapsed(t[0], t[1]);
         
         // Store the result image with the Gaussian filter applied
-        store_result(2, elapsed[0], 0, bitmap.width, bitmap.height,
-                     image_out_cpu[1], image_out_gpu[1], 0);
+        store_result(2, elapsed[0], elapsed[1], bitmap.width, bitmap.height,
+                     image_out_cpu[1], image_out_gpu[1], 1);
     }
     
     // Step 3: Apply a Sobel filter
